@@ -1,0 +1,126 @@
+"""Run all evaluators over a dataset, compare systems, check against a stored baseline, render a markdown report."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from statistics import mean
+
+from . import metrics as M
+from .agreement import align, cohen_kappa, interpret_kappa, percent_agreement, to_preference_pairs
+from .judge import get_judge
+from .rubric import rubric_score
+
+METRICS = ("rubric", "judge", "exact_match", "token_f1", "rouge_l")
+
+
+def score_item(item: dict, response: str, judge) -> dict:
+    rub, checks = rubric_score(response, item)
+    j = judge.score(item, response)
+    ref = item.get("reference")
+    row = {"id": item["id"], "task": item.get("task"), "rubric": rub, "checks": checks,
+           "judge": round((j["score"] - 1) / 4, 4), "judge_raw": j["score"], "judge_rationale": j["rationale"]}
+    if ref is not None:
+        row |= {"exact_match": M.exact_match(response, ref), "token_f1": round(M.token_f1(response, ref), 4),
+                "rouge_l": round(M.rouge_l(response, ref), 4)}
+    return row
+
+
+def summarize(rows: list[dict]) -> dict:
+    out = {}
+    for m in METRICS:
+        vals = [r[m] for r in rows if m in r]
+        out[m] = round(mean(vals), 4) if vals else None
+    out["n"] = len(rows)
+    return out
+
+
+def pairs_from_items(items: list[dict], a: str, b: str) -> list[dict]:
+    return [{"pair_id": it["id"], "prompt": it["prompt"], "response_a": it["responses"][a],
+             "response_b": it["responses"][b]} for it in items if a in it["responses"] and b in it["responses"]]
+
+
+def run(items: list[dict], labels: list[dict] | None = None, judge=None, systems: tuple[str, str] = ("sys_a", "sys_b")) -> dict:
+    judge = judge or get_judge()
+    per_system = {s: [score_item(it, it["responses"][s], judge) for it in items if s in it["responses"]] for s in systems}
+    result: dict = {"judge_backend": judge.name, "systems": {s: summarize(r) for s, r in per_system.items()},
+                    "rows": per_system}
+    a, b = systems
+    pairs = pairs_from_items(items, a, b)
+    by_id = {it["id"]: it for it in items}
+    verdicts = {p["pair_id"]: judge.pairwise(by_id[p["pair_id"]], p["response_a"], p["response_b"])["winner"] for p in pairs}
+    result["pairwise"] = {"judge_verdicts": verdicts,
+                          "judge_win_rate_a": round(sum(v == "A" for v in verdicts.values()) / len(verdicts), 4),
+                          "judge_tie_rate": round(sum(v == "tie" for v in verdicts.values()) / len(verdicts), 4)}
+    if labels:
+        annotators = sorted({r["annotator"] for r in labels})
+        agreement = {}
+        if len(annotators) >= 2:
+            ids, la, lb = align(labels, annotators[0], annotators[1])
+            k = cohen_kappa(la, lb)
+            agreement["human_human"] = {"raters": annotators[:2], "n": len(ids), "kappa": round(k, 4),
+                                        "interpretation": interpret_kappa(k),
+                                        "percent_agreement": round(percent_agreement(la, lb), 4)}
+        for ann in annotators:
+            ann_labels = {r["pair_id"]: r["label"] for r in labels if r["annotator"] == ann}
+            ids = sorted(set(ann_labels) & set(verdicts))
+            k = cohen_kappa([ann_labels[i] for i in ids], [verdicts[i] for i in ids])
+            agreement[f"judge_vs_{ann}"] = {"n": len(ids), "kappa": round(k, 4), "interpretation": interpret_kappa(k)}
+        result["agreement"] = agreement
+        result["preference_pairs"] = to_preference_pairs(pairs, labels)
+    return result
+
+
+def check_baseline(result: dict, baseline: dict, tolerance: float = 0.02) -> list[str]:
+    """Return a list of regressions: metrics that dropped more than `tolerance` below the stored baseline."""
+    failures = []
+    for system, metrics in baseline.get("systems", {}).items():
+        current = result["systems"].get(system, {})
+        for m, base in metrics.items():
+            cur = current.get(m)
+            if base is None:
+                continue
+            if cur is None or cur < base - tolerance:
+                failures.append(f"{system}.{m}: {cur} < baseline {base} (tolerance {tolerance})")
+    for key, base in baseline.get("agreement", {}).items():
+        cur = result.get("agreement", {}).get(key, {}).get("kappa")
+        if cur is None or cur < base - tolerance:
+            failures.append(f"agreement.{key}.kappa: {cur} < baseline {base} (tolerance {tolerance})")
+    return failures
+
+
+def make_baseline(result: dict) -> dict:
+    return {"systems": {s: {m: v for m, v in summ.items() if m in METRICS} for s, summ in result["systems"].items()},
+            "agreement": {k: v["kappa"] for k, v in result.get("agreement", {}).items()}}
+
+
+def to_markdown(result: dict, dataset: str = "") -> str:
+    f = lambda v: "–" if v is None else f"{v:.2f}"  # noqa: E731
+    systems = list(result["systems"])
+    lines = [f"# Results — synthetic examples, `{result['judge_backend']}` judge", "",
+             f"Generated by `python -m llm_eval.cli run{' --data ' + dataset if dataset else ''}`. The dataset, the system",
+             "responses and the annotator labels are synthetic examples written for this repo; the numbers only show what the",
+             "harness outputs.", "",
+             "## Scores per system (mean over items, 0–1)", "",
+             "| metric | " + " | ".join(systems) + " |", "|---|" + "---|" * len(systems)]
+    for m in METRICS:
+        lines.append(f"| {m} | " + " | ".join(f(result['systems'][s][m]) for s in systems) + " |")
+    pw = result["pairwise"]
+    lines += ["", "## Pairwise (judge)", "",
+              f"- `{systems[0]}` preferred on {pw['judge_win_rate_a']:.0%} of pairs, ties {pw['judge_tie_rate']:.0%}", ""]
+    if "agreement" in result:
+        lines += ["## Agreement (Cohen's kappa)", "", "| raters | n | kappa | interpretation |", "|---|---|---|---|"]
+        for k, v in result["agreement"].items():
+            lines.append(f"| {k} | {v['n']} | {v['kappa']:.2f} | {v['interpretation']} |")
+        lines += ["", f"Preference pairs exported (majority label, ties dropped): {len(result['preference_pairs'])}", ""]
+    lines += ["## Per item", "", "| id | task | " + " | ".join(f"{s} rubric | {s} judge" for s in systems) + " | judge verdict |",
+              "|---|---|" + "---|---|" * len(systems) + "---|"]
+    rows = {s: {r["id"]: r for r in result["rows"][s]} for s in systems}
+    for rid, r0 in rows[systems[0]].items():
+        cells = " | ".join(f"{f(rows[s][rid]['rubric'])} | {rows[s][rid]['judge_raw']}/5" for s in systems)
+        lines.append(f"| {rid} | {r0['task']} | {cells} | {pw['judge_verdicts'].get(rid, '–')} |")
+    return "\n".join(lines) + "\n"
+
+
+def save(result: dict, path: str | Path) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Path(path).write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")

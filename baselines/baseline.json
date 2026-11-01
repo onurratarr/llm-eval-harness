@@ -1,0 +1,23 @@
+{
+  "systems": {
+    "sys_a": {
+      "rubric": 1.0,
+      "judge": 0.9,
+      "exact_match": 0.25,
+      "token_f1": 0.6555,
+      "rouge_l": 0.6555
+    },
+    "sys_b": {
+      "rubric": 0.25,
+      "judge": 0.325,
+      "exact_match": 0.25,
+      "token_f1": 0.539,
+      "rouge_l": 0.5342
+    }
+  },
+  "agreement": {
+    "human_human": 0.5,
+    "judge_vs_ann_1": 0.2857,
+    "judge_vs_ann_2": 0.4444
+  }
+}
